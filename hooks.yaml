@@ -1,0 +1,20 @@
+---
+global:
+  empty_commit: '0000000000000000000000000000000000000000'
+pre-receive:
+  branch_based_merge:
+    # oob_regex
+    #   A regex to be used to evaluate against the MR description
+    #   Regex operators should evaluate against a String type (ruby)
+    oob_regex: ''
+    # api_token
+    #   The GitLab API token to be able to query the Merge Requests API to
+    #   check the description for out-of-band merges
+    api_token: ''
+    # branches
+    #   A list of controlled branches (keys) that each contain a list of valid
+    #   branches to merge from (Array(value))
+    #   Default example translates to {'master' => ['staging']}
+    branches:
+      master:
+        - staging

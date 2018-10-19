@@ -1,0 +1,142 @@
+#!/usr/bin/env ruby
+
+require 'yaml'
+require 'json'
+require 'net/http'
+
+def fail_hook(message)
+  puts message
+  exit(1)
+end
+
+def pass_hook
+  exit(0)
+end
+
+hooks_dir = File.expand_path(File.dirname(__FILE__))
+config_file = File.join(hooks_dir, 'hooks.yaml')
+
+# Use namespaced path
+ns_path = File.join(File.expand_path(ENV['PWD']).split('/').last(2))
+repo_name = File.join(File.dirname(ns_path), File.basename(ns_path, '.git'))
+
+# Load options
+begin
+  options = YAML.load_file(config_file)
+rescue Errno::ENOENT
+  fail_hook("Error loading custom hooks configuration file at #{config_file}")
+end
+
+# The pre-receive hook receives 3 command-line arguments, separated by spaces
+# on STDIN
+#
+# oldrev
+#   The original HEAD from the destination branch
+#
+# newrev
+#   Newly calculated HEAD for the completed merge
+#
+# refname
+#   The destination branch of the merge/push
+oldrev, newrev, refname = STDIN.read.split(' ')
+refname.slice!('refs/heads/')
+
+# Check if the branch in question is even in our list of configured branches
+if ! options['pre-receive']['branch_based_merge']['branches'].key?(refname) then
+  pass_hook
+else
+  # Since we have a valid destination branch, let's get the valid source branch
+  # list
+  valid_branches = options['pre-receive']['branch_based_merge']['branches'][refname]
+
+  merge_parent_revs = %x[git log -1 --pretty='%P' #{newrev}].split(' ')
+
+  valid_source_revs = Array.new
+  valid_branches.each do |branch|
+    valid_source_revs << %x[git show-ref refs/heads/#{branch}].split(' ').first
+  end
+
+  # Now we have a list of valid source branch HEAD refs and valid merge parents
+  # We union the arrays and check if it's empty
+  if ! (valid_source_revs & merge_parent_revs).empty? then
+    pass_hook
+  end
+
+  # If we are still operating at this point we want to check if this merge/push
+  # is for a revert. In that case, we need to check if the parent rev is
+  # in the historical revs of the target branch
+  rev_history = %x[git log --pretty='%H' refs/heads/#{refname}].split("\n")
+  if rev_history.include?(merge_parent_revs.last) then
+    pass_hook
+  end
+
+  # If this is not a valid fast-forward merge from a permitted branch, nor a
+  # revert, then we should check the merge message and check for a configured
+  # out of band regex
+  oob_regex = options['pre-receive']['branch_based_merge']['oob_regex']
+  api_token = options['pre-receive']['branch_based_merge']['api_token']
+
+  if ! oob_regex.empty? and ! api_token.empty? then
+    # At this point we should lookup the project id and the merge request info
+    # and be sure to handle pagination for servers with large amounts of
+    # projects
+    next_page = '1'
+    result = []
+    while ! next_page.empty? do
+      uri = URI.parse("http://localhost/api/v4/projects?page=#{next_page}")
+      request = Net::HTTP::Get.new(uri)
+      request['PRIVATE-TOKEN'] = api_token
+      req_options = {
+        use_ssl: false,
+      }
+
+      response = Net::HTTP.start(uri.hostname, uri.port, req_options) do |http|
+        http.request(request)
+      end
+
+      if response.code == '200' then
+        result.concat(JSON.parse(response.body))
+        next_page = response['x-next-page']
+      else
+        next_page = ''
+      end
+    end
+
+    project_id = -1
+    result.each do |project|
+      if project['path_with_namespace'] == repo_name then
+        project_id = project['id']
+        break
+      end
+    end
+
+    # At this point we should have a project_id to get the merge info from
+    if project_id != -1 then
+      mr_id = %x[git show-ref].split("\n").grep(/^#{merge_parent_revs.last}.*merge-requests/).first.split('/')[-2]
+      result = []
+      uri = URI.parse("http://localhost/api/v4/projects/#{project_id}/merge_requests?iids=#{mr_id}")
+      request = Net::HTTP::Get.new(uri)
+      request['PRIVATE-TOKEN'] = api_token
+      req_options = {
+        use_ssl: false
+      }
+
+      response = Net::HTTP.start(uri.hostname, uri.port, req_options) do |http|
+        http.request(request)
+      end
+
+      if response.code == '200' then
+        result = JSON.parse(response.body)
+        if result.length == 1 then
+          # make sure we only got 1 result or...bad
+          if result[0]['description'].match(Regexp.new(oob_regex)) then
+            pass_hook
+          end
+        end
+      end
+    end
+  end
+end
+
+# If we get to the end without the hook passing, we fail the hook
+fail_hook("Merges to the branch #{refname} must originate from the following branch(es): " + valid_branches.join(', ') + ". Merges from other branches are not allowed.")
